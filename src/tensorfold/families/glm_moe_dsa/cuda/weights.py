@@ -8,6 +8,7 @@ rows) and each MoE layer's routed experts one ``Exl3RoutedExperts`` (a width per
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +24,25 @@ from . import split
 EXL3_PARTS = ("trellis", "suh", "svh")
 
 
+def drop_page_cache(paths) -> int:
+    """POSIX_FADV_DONTNEED on each file (symlinks followed); returns how many were advised. GB10 unified memory:
+    torch.cuda.mem_get_info() does not count clean page cache as free, so the checkpoint pages a load leaves behind
+    (~40 GB after 58 shards) hide memory from the cache guard (runner._check_cache_fits). Only clean, unmapped pages
+    are dropped, so this is always safe; the guard and its reserve are unchanged."""
+    n = 0
+    for p in paths:
+        try:
+            fd = os.open(str(p), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            n += 1
+        finally:
+            os.close(fd)
+    return n
+
+
 class RankReader:
     """Tensors of one rank's share, from the full checkpoint (safetensors slices)."""
 
@@ -33,6 +53,26 @@ class RankReader:
 
     def has(self, name: str) -> bool:
         return name in self.index
+
+    def clear_cache(self):
+        opened = list(self._open)
+        self._open.clear()
+        import gc, ctypes
+        gc.collect()
+        try:
+            ctypes.CDLL('libc.so.6').malloc_trim(0)
+        except Exception:
+            pass
+        drop_page_cache(self.dir / fn for fn in opened)      # after the handles (and their mmaps) are gone
+
+    def files(self) -> list:
+        """Every checkpoint file this reader may open: the index's shards (lm_head included) and any *.safetensors."""
+        return sorted({self.dir / fn for fn in self.index.values()} | set(self.dir.glob("*.safetensors")))
+
+    def drop_page_cache(self) -> int:
+        """Close every handle, then drop every checkpoint file's clean page cache (``drop_page_cache``)."""
+        self._open.clear()
+        return drop_page_cache(self.files())
 
     def _file(self, name: str):
         fn = self.index[name]

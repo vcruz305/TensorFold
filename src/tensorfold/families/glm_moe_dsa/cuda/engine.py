@@ -25,7 +25,7 @@ from ..config import Config
 from . import fused
 from .model import RankModel
 from .runner import Runner
-from .weights import RankReader, load_layer, load_mtp
+from .weights import RankReader, drop_page_cache, load_layer, load_mtp
 
 WORLD = 4
 DEFAULT_CONTEXT = 32768      # until the capacity estimate (M7) sizes it from free memory
@@ -84,7 +84,12 @@ class Glm53Engine:
         n = cfg.num_hidden_layers if layers is None else layers
         embed, norm, head = (r.get(t, "cuda") for t in ("model.embed_tokens.weight", "model.norm.weight",
                                                          "lm_head.weight"))
-        layers = [load_layer(r, cfg, i) for i in range(n)]
+        layers = []
+        for i in range(n):
+            layers.append(load_layer(r, cfg, i))
+            r.clear_cache()
+            if rank == 0 and (i % 10 == 0 or i == n - 1):
+                print(f"[tensorfold] Loaded layer {i+1}/{n}", flush=True)
         self.k = int(mtp_drafts) if cfg.num_mtp_layers else 0
         self.mtp = load_mtp(r, cfg) if self.k else None
         _trim_host()
@@ -133,8 +138,11 @@ class Glm53Engine:
                       flush=True)
             sl = None                                    # the checkpoint reader's handles and heap: gone before
             r._open.clear()                              # the caches and buffers allocate (GB10 unified memory:
+            dropped = r.drop_page_cache()                # + every shard's clean page cache: mem_get_info excludes it
             del r                                        # host memory is device memory; a 1M cache needs it all)
             _trim_host()
+            print(f"[tensorfold] rank {rank}: dropped page cache of {dropped} checkpoint files; device free "
+                  f"{torch.cuda.mem_get_info()[0] / 2**30:.1f} GiB before the caches", flush=True)
             dpath = os.environ.get("TF_GLM53_DFLASH", "")
             if dpath:                                    # DFlash2: the target taps its layers before buffers exist
                 dcfg = json.loads((Path(dpath) / "config.json").read_text())
@@ -144,6 +152,7 @@ class Glm53Engine:
                 from .dflash import GlmDrafter
 
                 dr = GlmDrafter(dpath, fw, capacity=self.limit + 16)
+                drop_page_cache(sorted(Path(dpath).glob("*.safetensors")))   # the drafter's pages too
                 if GRAPHS and self.parallel == 1:        # concurrent: multi.MultiDrafter captures its own passes
                     dr.capture()
                 self.runner.drafter = dr
