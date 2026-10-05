@@ -272,14 +272,20 @@ class Runner:
         (10-02: --parallel 4 x 140K context = ~50 GB a rank on top of 65 GB of weights rebooted all four Sparks)."""
         c = w.cfg
         local = -(-capacity // w.dcp) + 1
-        row = len(w.layers) * (c.kv_lora_rank + c.qk_rope_head_dim) * 2         # bf16 latent rows, every layer
+        kvd = getattr(w, "kv_dtype", "bf16")
+        row = len(w.layers) * fused.kvq.row_bytes(c.kv_lora_rank, c.qk_rope_head_dim, kvd)   # latent rows, every layer
+        if kvd != "bf16":            # quantized latent: count what State allocates - the bf16 index keys of the full
+            row += sum(1 for L in w.layers if L.indexer is not None) * c.index_head_dim * 2   # layers (5376 B a
+            if w.mtp is not None:                                                            # token on GLM-5.3, 14%
+                row += fused.kvq.row_bytes(c.kv_lora_rank, c.qk_rope_head_dim, kvd) + c.index_head_dim * 2   # of int4)
         need = row * local * slots
         free = torch.cuda.mem_get_info()[0]
         spare = min(float(os.environ.get("TF_GLM53_CACHE_RESERVE_GB", "6")) * (1 << 30), free / 2)   # small GPUs /
         # several ranks on one GPU (tests: four rank threads): the reserve never exceeds half of what is free
         if need > free - spare:
             fit = max(0, int((free - spare) // (row * slots)) * w.dcp)
-            raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank, "
+            raise RuntimeError(f"context {capacity} x {slots} streams needs {need / 2**30:.1f} GiB of caches a rank"
+                               f"{'' if kvd == 'bf16' else f' ({kvd} latent)'}, "
                                f"{free / 2**30:.1f} GiB is free (keeping {spare / 2**30:.0f} GiB spare): use --context "
                                f"<= {fit} with --parallel {slots}, or fewer streams")
 

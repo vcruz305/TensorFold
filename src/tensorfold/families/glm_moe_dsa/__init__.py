@@ -16,6 +16,9 @@ MODELS = ()                       # the qualified checkpoint is added once it is
 QUANT_METHODS = {"cuda": ("exl3",)}
 EXL3_VARIANT = "any"              # any codebook and width per tensor (the universal EXL3 module reads them all)
 CUDA_TP = (4,)                    # ~276 GB at 2.75 bpw: four 128 GB GPUs, one per machine
+# the MLA latent cache dtypes the CUDA engine can allocate (``--kv-dtype``): int8 / int4 store ExLlamaV3's -cq 8 / -cq 4
+# codes (H32-rotated groups of 32, one fp16 scale each); RoPE dims and indexer keys stay bf16 (cuda/kvq.py)
+CUDA_KV_DTYPES = ("bf16", "int8", "int4")
 
 
 def check(model_dir: str | Path) -> None:
@@ -35,7 +38,10 @@ def check(model_dir: str | Path) -> None:
 
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
-                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
+                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
+                kv_dtype: str = "bf16", **options: Any):
+    if kv_dtype not in CUDA_KV_DTYPES:       # refuse an unknown cache before any weight is read (no torch import)
+        raise ValueError(f"kv-dtype {kv_dtype!r}: {TITLE} on CUDA serves a {' or '.join(CUDA_KV_DTYPES)} KV cache")
     if int(tp) not in CUDA_TP:
         raise ValueError("GLM-5.3 needs four GPUs, one per machine: run the same `tensorfold serve` command with "
                          "--tp 4 --rank R --master ADDRESS on all four (ranks 1-3 first)")
@@ -46,4 +52,5 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     # eager engine: MTP drafts verified exactly, token-level DSA (docs/design/glm-moe-dsa-tp4.md)
     k = 0 if no_drafts else (2 if mtp_drafts is None else int(mtp_drafts))
     return Glm53Engine(Path(model_dir), rank=int(rank), master=master, port=int(master_port),
-                       context=options.get("context"), mtp_drafts=k, parallel=int(options.get("parallel") or 1))
+                       context=options.get("context"), mtp_drafts=k, parallel=int(options.get("parallel") or 1),
+                       kv_dtype=kv_dtype)

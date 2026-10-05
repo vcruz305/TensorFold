@@ -28,6 +28,8 @@ from tensorfold.families.glm5_next.cuda import glue, latent
 from tensorfold.families.glm_moe_dsa.cuda import topk
 
 from ..config import Config
+from . import kvq
+from .kvq import lat_tile, quant_exl3, rot_rows
 from .weights import Layer, MtpHead
 
 # attention tilings (tools/bench_attn_prefill.py on GB10), by window class - a function of the class alone, so every
@@ -102,6 +104,43 @@ def _kv_write(KVA, kva_stride, NW, LC, POS, INV, eps, LW: tl.constexpr, RD: tl.c
     ra, rb = _rope_pair(a, b, tl.cos(ang), tl.sin(ang))
     tl.store(LC + p * (LW + RD) + LW + i, ra.to(tl.bfloat16))
     tl.store(LC + p * (LW + RD) + LW + RD // 2 + i, rb.to(tl.bfloat16))
+
+
+@triton.jit
+def _kv_write_q(KVA, kva_stride, NW, LQ, LS, LR, POS, INV, eps, LW: tl.constexpr, RD: tl.constexpr,
+                BITS: tl.constexpr, RCP: tl.constexpr, DCP: tl.constexpr = 1, RANK: tl.constexpr = 0, BASE=None,
+                ROWS: tl.constexpr = False):
+    """_kv_write into a quantized latent cache (kvq.LatentCache, --kv-dtype int4/int8): the same bf16 latent bits,
+    then ExLlamaV3's quantizer (kvq.quant_exl3) -> codes LQ[p], fp16 scales LS[p]; the RoPE dims bf16 -> LR[p]."""
+    r = tl.program_id(0)
+    if ROWS:
+        pg = tl.load(POS + r).to(tl.int64)
+        p = tl.load(BASE + r).to(tl.int64) + pg
+    else:
+        pg = (tl.load(POS) + r).to(tl.int64)
+        if DCP > 1:
+            if pg % DCP != RANK:
+                return
+        p = pg // DCP
+    ang_p = pg
+    k = tl.arange(0, LW)
+    x = tl.load(KVA + r * kva_stride + k).to(tl.float32)
+    rinv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / LW + eps)
+    w = tl.load(NW + k).to(tl.float32)
+    y = (w * (x * rinv).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)        # the bf16 cache's latent bits
+    code, s = quant_exl3(tl.reshape(y.to(tl.float32), (LW // 32, 32)), M=LW // 32, BITS=BITS, RCP=RCP)
+    if BITS == 4:
+        tl.store(LQ + p * (LW // 2) + tl.arange(0, LW // 2), tl.reshape(code, (LW // 2,)))
+    else:
+        tl.store(LQ + p * LW + k, tl.reshape(code, (LW,)))
+    tl.store(LS + p * (LW // 32) + tl.arange(0, LW // 32), s)
+    i = tl.arange(0, RD // 2)
+    a = tl.load(KVA + r * kva_stride + LW + 2 * i).to(tl.float32)
+    b = tl.load(KVA + r * kva_stride + LW + 2 * i + 1).to(tl.float32)
+    ang = ang_p.to(tl.float32) * tl.load(INV + i)
+    ra, rb = _rope_pair(a, b, tl.cos(ang), tl.sin(ang))
+    tl.store(LR + p * RD + i, ra.to(tl.bfloat16))
+    tl.store(LR + p * RD + RD // 2 + i, rb.to(tl.bfloat16))
 
 
 @triton.jit
@@ -272,6 +311,115 @@ def _attn_dcp(QALL, LC, TOK, CNT, POS, PO, PM, PL, R, H: tl.constexpr, G: tl.con
             m = next_m
     base = (c * R + r) * (G * H) + grp * H + hh
     tl.store(PO + base[:, None] * LW + kl[None, :], o)
+    tl.store(PM + base, m)
+    tl.store(PL + base, l)
+
+
+@triton.jit
+def _attn_chunks_q(QA, QR, LQ, LS, LR, TOK, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr,
+                   RD: tl.constexpr, K: tl.constexpr, CHK: tl.constexpr, KTT: tl.constexpr, SCALE: tl.constexpr,
+                   BITS: tl.constexpr, DIRECT: tl.constexpr = False, BASE=None, ROWS: tl.constexpr = False,
+                   F16: tl.constexpr = True):
+    """_attn_chunks over a quantized latent cache (kvq.LatentCache): keys dequantized per tile (still H32-rotated,
+    bf16), the latent query rotated in once (H32 is orthonormal: q . k = Hq . Hk), the value sum kept rotated and
+    rotated back before it is stored (normalized output, or this chunk's partial: the merge is linear). RoPE keys
+    bf16 as in the bf16 cache. Row r alone, the same grid and key order as _attn_chunks. F16: the latent dot and the
+    value sum take fp16 tiles (ExLlamaV3's plane-loader precision), else bf16."""
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    if ROWS:                                     # several streams: the row's position, its stream's cache rows
+        p = tl.load(POS + r)
+        row0 = tl.load(BASE + r).to(tl.int64)
+    else:
+        p = tl.load(POS) + r
+        row0 = 0
+    n = tl.minimum(p + 1, K)
+    hh = tl.arange(0, H)
+    kl = tl.arange(0, LW)
+    kr = tl.arange(0, RD)
+    m = tl.full((H,), float("-inf"), tl.float32)
+    l = tl.zeros((H,), tl.float32)
+    o = tl.zeros((H, LW), tl.float32)
+    start = c * CHK
+    if start < n:
+        ql = tl.load(QA + (r * H + hh[:, None]) * LW + kl[None, :]).to(tl.float32)
+        ql = rot_rows(ql, H, LW).to(tl.float16 if F16 else tl.bfloat16)
+        qr = tl.load(QR + (r * H + hh[:, None]) * RD + kr[None, :])
+        for t in range(CHK // KTT):
+            idx = start + t * KTT + tl.arange(0, KTT)
+            ok = idx < n
+            if p < K:
+                key = idx.to(tl.int64)
+            else:
+                key = tl.load(TOK + r * K + idx, mask=ok, other=0).to(tl.int64)
+            key = key + row0
+            kv = lat_tile(LQ, LS, key, ok, LW, KTT, BITS, F16)
+            kro = tl.load(LR + key[:, None] * RD + kr[None, :], mask=ok[:, None], other=0.0)
+            s = (tl.dot(ql, tl.trans(kv)) + tl.dot(qr, tl.trans(kro))) * SCALE
+            s = tl.where(ok[None, :], s, float("-inf"))
+            tile_m = tl.max(s, 1)
+            active = tile_m != float("-inf")
+            next_m = tl.where(active, tl.maximum(m, tile_m), m)
+            alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+            pr = tl.where(ok[None, :] & active[:, None], tl.exp(s - next_m[:, None]), 0.0)
+            o = o * alpha[:, None] + tl.dot(pr.to(kv.dtype), kv)
+            l = l * alpha + tl.sum(pr, 1)
+            m = next_m
+    if DIRECT:          # one chunk covers the row's list: the normalized output, rotated back -> PO
+        tl.store(PO + (r * H + hh[:, None]) * LW + kl[None, :], rot_rows(o / l[:, None], H, LW).to(tl.bfloat16))
+    else:
+        base = (c * R + r) * H + hh
+        tl.store(PO + base[:, None] * LW + kl[None, :], rot_rows(o, H, LW))
+        tl.store(PM + base, m)
+        tl.store(PL + base, l)
+
+
+@triton.jit
+def _attn_dcp_q(QALL, LQ, LS, LR, TOK, CNT, POS, PO, PM, PL, R, H: tl.constexpr, G: tl.constexpr, LW: tl.constexpr,
+                RD: tl.constexpr, K: tl.constexpr, CHK: tl.constexpr, KTT: tl.constexpr, SCALE: tl.constexpr,
+                DCP: tl.constexpr, RANK: tl.constexpr, BITS: tl.constexpr, F16: tl.constexpr = True):
+    """_attn_dcp over a quantized latent cache (as _attn_chunks_q: rotated query, rotated value sum, partials
+    rotated back before they are stored)."""
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    grp = tl.program_id(2)
+    p = tl.load(POS) + r
+    if p < K:
+        n = tl.where(p >= RANK, (p - RANK) // DCP + 1, 0)
+    else:
+        n = tl.load(CNT + r)
+    hh = tl.arange(0, H)
+    kl = tl.arange(0, LW)
+    kr = tl.arange(0, RD)
+    m = tl.full((H,), float("-inf"), tl.float32)
+    l = tl.zeros((H,), tl.float32)
+    o = tl.zeros((H, LW), tl.float32)
+    start = c * CHK
+    if start < n:
+        qb = QALL + ((grp * R + r) * H + hh[:, None]) * (LW + RD)
+        ql = rot_rows(tl.load(qb + kl[None, :]).to(tl.float32), H, LW).to(tl.float16 if F16 else tl.bfloat16)
+        qr = tl.load(qb + LW + kr[None, :])
+        for t in range(CHK // KTT):
+            idx = start + t * KTT + tl.arange(0, KTT)
+            ok = idx < n
+            if p < K:
+                key = idx.to(tl.int64)
+            else:
+                key = tl.load(TOK + r * K + idx, mask=ok, other=0).to(tl.int64)
+            kv = lat_tile(LQ, LS, key, ok, LW, KTT, BITS, F16)
+            kro = tl.load(LR + key[:, None] * RD + kr[None, :], mask=ok[:, None], other=0.0)
+            s = (tl.dot(ql, tl.trans(kv)) + tl.dot(qr, tl.trans(kro))) * SCALE
+            s = tl.where(ok[None, :], s, float("-inf"))
+            tile_m = tl.max(s, 1)
+            active = tile_m != float("-inf")
+            next_m = tl.where(active, tl.maximum(m, tile_m), m)
+            alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+            pr = tl.where(ok[None, :] & active[:, None], tl.exp(s - next_m[:, None]), 0.0)
+            o = o * alpha[:, None] + tl.dot(pr.to(kv.dtype), kv)
+            l = l * alpha + tl.sum(pr, 1)
+            m = next_m
+    base = (c * R + r) * (G * H) + grp * H + hh
+    tl.store(PO + base[:, None] * LW + kl[None, :], rot_rows(o, H, LW))
     tl.store(PM + base, m)
     tl.store(PL + base, l)
 
@@ -466,6 +614,7 @@ class Weights:
         self.fast = None                 # RoceReduce for decode windows (engine sets it)
         self.tap_slot: dict[int, int] = {}   # DFlash2: target layer -> slot in Buffers.taps (engine sets it)
         self.dcp = 1                     # decode context parallelism: KV positions interleaved over the ranks
+        self.kv_dtype = "bf16"           # the latent cache: bf16, or kvq's int8 / int4 codes (engine sets it)
         self.vocab_off = rank * self.lm_head.shape[0]
         self.draft_head = self.draft_ids = None
         every = layers + ([mtp.layer] if mtp is not None else [])
@@ -659,19 +808,28 @@ class State:
             raise ValueError("concurrent streams need decode context parallelism off (DCP 1)")
         self.local = local
         rows = local * slots
-        self.kc = [torch.zeros((rows, lw), dtype=torch.bfloat16, device=dev) for _ in range(n)]
+        kvd = kvq.check(getattr(w, "kv_dtype", "bf16"))
+        self.kv_dtype = kvd
+
+        def latent_rows():
+            if kvd == "bf16":
+                return torch.zeros((rows, lw), dtype=torch.bfloat16, device=dev)
+            return kvq.LatentCache(rows, c.kv_lora_rank, c.qk_rope_head_dim, dev, kvd)
+
+        self.kc = [latent_rows() for _ in range(n)]
+        # index keys: bf16 in every --kv-dtype (ExLlamaV3's quantized MLA cache keeps its k_idx plane fp16 too)
         self.ic = {L.index: torch.zeros((rows, c.index_head_dim), dtype=torch.bfloat16, device=dev)
                    for L in w.layers if L.indexer is not None}
         self.pos = torch.zeros((1,), dtype=torch.int32, device=dev)
         self.mpos = torch.zeros((1,), dtype=torch.int32, device=dev)
         self.mkc = self.mic = None
         if w.mtp is not None:
-            self.mkc = torch.zeros((rows, lw), dtype=torch.bfloat16, device=dev)
+            self.mkc = latent_rows()
             self.mic = torch.zeros((rows, c.index_head_dim), dtype=torch.bfloat16, device=dev)
 
     def nbytes(self) -> int:
         ts = self.kc + list(self.ic.values()) + [t for t in (self.mkc, self.mic) if t is not None]
-        return sum(t.numel() * t.element_size() for t in ts)
+        return sum(kvq.cache_nbytes(t) for t in ts)
 
     def view(self, s: int) -> "SlotView":
         return SlotView(self, s)
@@ -910,6 +1068,19 @@ def _attention_local(w: Weights, b: Buffers, R: int, cache, pos, nch, chk, kt, n
     c, H = w.cfg, w.heads
     lw, rd, nope = c.kv_lora_rank, c.qk_rope_head_dim, c.qk_nope_head_dim
     n = nch * R * H
+    if isinstance(cache, kvq.LatentCache):           # --kv-dtype int4 / int8: the same grid, keys dequantized
+        q = (cache.c, cache.s, cache.r)
+        if nch == 1:
+            _attn_chunks_q[(R, 1)](b.qlat, b.qrot, *q, b.tok, pos, b.ol, b.pm, b.pl, R, H=H, LW=lw, RD=rd,
+                                   K=c.index_topk, CHK=chk, KTT=kt, SCALE=(nope + rd) ** -0.5, BITS=cache.bits,
+                                   DIRECT=True, BASE=base, ROWS=base is not None, F16=kvq.TILE_F16, num_warps=nw,
+                                   num_stages=ns)
+            return
+        _attn_chunks_q[(R, nch)](b.qlat, b.qrot, *q, b.tok, pos, b.po[:n * lw], b.pm[:n], b.pl[:n], R, H=H, LW=lw,
+                                 RD=rd, K=c.index_topk, CHK=chk, KTT=kt, SCALE=(nope + rd) ** -0.5, BITS=cache.bits,
+                                 BASE=base, ROWS=base is not None, F16=kvq.TILE_F16, num_warps=nw, num_stages=ns)
+        latent._merge[(R, H)](b.po, b.pm, b.pl, b.ol, b.dummy, R, H=H, LW=lw, NCH=nch, SPARSE=False, num_warps=4)
+        return
     if nch == 1:                    # one pass: no partials, no merge (the same bits as one chunk + _merge)
         _attn_chunks[(R, 1)](b.qlat, b.qrot, cache, b.tok, pos, b.ol, b.pm, b.pl, R, H=H, LW=lw, RD=rd,
                              K=c.index_topk, CHK=chk, KTT=kt, SCALE=(nope + rd) ** -0.5, DIRECT=True, BASE=base,
@@ -933,9 +1104,15 @@ def _attention_dcp(w: Weights, b: Buffers, R: int, cache, pos, nch, chk, kt, nw,
     qall = b.qall.view(-1)[:G * R * H * (lw + rd)].view(G, R, H, lw + rd)
     dcp_gather(w, qp, qall, small)
     n = nch * R * G * H
-    _attn_dcp[(R, nch, G)](qall, cache, b.tok, b.cnt, pos, b.po[:n * lw], b.pm[:n], b.pl[:n], R, H=H, G=G, LW=lw,
-                           RD=rd, K=c.index_topk, CHK=chk, KTT=kt, SCALE=(nope + rd) ** -0.5, DCP=G, RANK=rank,
-                           num_warps=nw, num_stages=ns)
+    if isinstance(cache, kvq.LatentCache):
+        _attn_dcp_q[(R, nch, G)](qall, cache.c, cache.s, cache.r, b.tok, b.cnt, pos, b.po[:n * lw], b.pm[:n],
+                                 b.pl[:n], R, H=H, G=G, LW=lw, RD=rd, K=c.index_topk, CHK=chk, KTT=kt,
+                                 SCALE=(nope + rd) ** -0.5, DCP=G, RANK=rank, BITS=cache.bits, F16=kvq.TILE_F16,
+                                 num_warps=nw, num_stages=ns)
+    else:
+        _attn_dcp[(R, nch, G)](qall, cache, b.tok, b.cnt, pos, b.po[:n * lw], b.pm[:n], b.pl[:n], R, H=H, G=G,
+                               LW=lw, RD=rd, K=c.index_topk, CHK=chk, KTT=kt, SCALE=(nope + rd) ** -0.5, DCP=G,
+                               RANK=rank, num_warps=nw, num_stages=ns)
     osend = b.osend.view(-1)[:G * R * H * lw]
     lsend = b.lsend.view(-1)[:G * R * H]
     _merge_lse[(R, G * H)](b.po, b.pm, b.pl, osend, lsend, R, HT=G * H, H=H, LW=lw, NCH=nch, num_warps=4)
@@ -952,6 +1129,22 @@ def _attention_dcp(w: Weights, b: Buffers, R: int, cache, pos, nch, chk, kt, nw,
         w.comm.all_to_all(lsend.view(G, R * H), lrecv.view(G, R * H))
         o0, l0, ss, ssl = 0, 0, R * H * lw, R * H
     _dcp_combine[(R, H)](orecv[o0:], lrecv[l0:], b.ol, R, ss, ssl, H=H, LW=lw, WORLD=G, num_warps=4)
+
+
+def kv_write(w: Weights, L: Layer, b: Buffers, R: int, cache, pos: torch.Tensor, dcp: int = 1, rank: int = 0,
+             base: torch.Tensor | None = None) -> None:
+    """The window's latent rows (b.kva) into the cache: bf16 rows (_kv_write), or a kvq.LatentCache's codes,
+    scales and RoPE dims (_kv_write_q, --kv-dtype int4 / int8)."""
+    c = w.cfg
+    lw, rd = c.kv_lora_rank, c.qk_rope_head_dim
+    rows = base is not None
+    if isinstance(cache, kvq.LatentCache):
+        _kv_write_q[(R,)](b.kva, b.kva.stride(0), L.kv_a_norm, cache.c, cache.s, cache.r, pos, w.inv, c.rms_norm_eps,
+                          LW=lw, RD=rd, BITS=cache.bits, RCP=kvq.rcp_flag(), DCP=dcp, RANK=rank, BASE=base,
+                          ROWS=rows, num_warps=4)
+        return
+    _kv_write[(R,)](b.kva, b.kva.stride(0), L.kv_a_norm, cache, pos, w.inv, c.rms_norm_eps, LW=lw, RD=rd, DCP=dcp,
+                    RANK=rank, BASE=base, ROWS=rows, num_warps=4)
 
 
 def attention(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor, icache: torch.Tensor | None,
@@ -974,8 +1167,7 @@ def attention_part(w: Weights, L: Layer, b: Buffers, R: int, cache: torch.Tensor
     rows = base is not None
     if rows and dcp > 1:
         raise ValueError("several streams in one window need decode context parallelism off (DCP 1)")
-    _kv_write[(R,)](b.kva, b.kva.stride(0), L.kv_a_norm, cache, pos, w.inv, c.rms_norm_eps, LW=lw, RD=rd, DCP=dcp,
-                    RANK=rank, BASE=base, ROWS=rows, num_warps=4)
+    kv_write(w, L, b, R, cache, pos, dcp, rank, base)
     q_done = False                                       # q_b run with wq_b
     if L.indexer is not None:
         ix = L.indexer
@@ -1329,8 +1521,7 @@ def _front_attn(w: Weights, L: Layer, h: _SpHalf, cache, icache, T: int | None) 
             else:
                 bufs.append(b.iw)
     _ag_rows(w, h, *bufs)
-    _kv_write[(Rr,)](b.kva, b.kva.stride(0), L.kv_a_norm, cache, h.pos, w.inv, c.rms_norm_eps, LW=lw, RD=rd,
-                     num_warps=4)
+    kv_write(w, L, b, Rr, cache, h.pos)
     if ix is None:
         return
     _ik_write[(Rr,)](b.ik, L.extra["ik_w"], L.extra["ik_b"], w.inv, icache, h.pos, 1e-6, D=c.index_head_dim, RD=rd,
