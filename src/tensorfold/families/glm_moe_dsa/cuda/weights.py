@@ -157,9 +157,21 @@ def _experts(r: RankReader, cfg: Config, layer: int, device):
     return load_experts(r, cfg, layer, device)
 
 
+def _as_bf16(t: torch.Tensor, name: str) -> torch.Tensor:
+    """The engine's kernels take these unquantized tensors (kv_b, router gate, indexer wk / weights_proj / k_norm) as
+    bf16; exllamav3 packs store them as fp16. Cast only when every value is exactly representable in bf16 (GLM-5.3's
+    originals are bf16, so the fp16 copies round-trip bit for bit); anything lossy is refused, never rounded."""
+    if t.dtype != torch.float16:
+        return t
+    b = t.to(torch.bfloat16)
+    if torch.isnan(t).any() or not torch.equal(b.to(torch.float16), t):
+        raise ValueError(f"{name}: fp16 values not exactly representable in bf16; refusing a lossy cast")
+    return b
+
+
 def load_layer(r: RankReader, cfg: Config, layer: int, device="cuda", experts: bool = True) -> Layer:
     p = f"model.layers.{layer}"
-    bf = lambda n: r.get(n, device)  # noqa: E731
+    bf = lambda n: _as_bf16(r.get(n, device), n)  # noqa: E731
     moe = layer >= cfg.first_k_dense_replace
     mlp = f"{p}.mlp.shared_experts" if moe else f"{p}.mlp"
     idx = None
