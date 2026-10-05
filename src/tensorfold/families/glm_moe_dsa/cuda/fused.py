@@ -1070,6 +1070,8 @@ def _attention_local(w: Weights, b: Buffers, R: int, cache, pos, nch, chk, kt, n
     n = nch * R * H
     if isinstance(cache, kvq.LatentCache):           # --kv-dtype int4 / int8: the same grid, keys dequantized
         q = (cache.c, cache.s, cache.r)
+        if cache.bits == 8 and R > b.small:          # int8 prompt tiles: 2 stages need 140 KiB of shared memory
+            ns = 1                                   # (GB10: 99 KiB); stages change no arithmetic
         if nch == 1:
             _attn_chunks_q[(R, 1)](b.qlat, b.qrot, *q, b.tok, pos, b.ol, b.pm, b.pl, R, H=H, LW=lw, RD=rd,
                                    K=c.index_topk, CHK=chk, KTT=kt, SCALE=(nope + rd) ** -0.5, BITS=cache.bits,
@@ -1105,6 +1107,8 @@ def _attention_dcp(w: Weights, b: Buffers, R: int, cache, pos, nch, chk, kt, nw,
     dcp_gather(w, qp, qall, small)
     n = nch * R * G * H
     if isinstance(cache, kvq.LatentCache):
+        if cache.bits == 8 and not small:            # int8 prompt tiles: one stage (shared memory, as above)
+            ns = 1
         _attn_dcp_q[(R, nch, G)](qall, cache.c, cache.s, cache.r, b.tok, b.cnt, pos, b.po[:n * lw], b.pm[:n],
                                  b.pl[:n], R, H=H, G=G, LW=lw, RD=rd, K=c.index_topk, CHK=chk, KTT=kt,
                                  SCALE=(nope + rd) ** -0.5, DCP=G, RANK=rank, BITS=cache.bits, F16=kvq.TILE_F16,
