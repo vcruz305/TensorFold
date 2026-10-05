@@ -146,7 +146,9 @@ def quant_exl3(x, M: tl.constexpr, BITS: tl.constexpr, RCP: tl.constexpr):
 def lat_tile(LC, LS, key, ok, LW: tl.constexpr, KT: tl.constexpr, BITS: tl.constexpr, F16: tl.constexpr = True):
     """Rows ``key`` (int64 [KT], masked by ``ok``) of a quantized latent cache -> [KT, LW], still rotated: fp16 as
     ExLlamaV3's plane loaders produce it ((q - (2^(b-1) - 0.5)) * (s / 2^(b-1)), one rounding to fp16), or with F16
-    off kvquant's bf16 dequant. Masked rows read as zeros."""
+    off kvquant's bf16 dequant. Masked rows read as zeros.
+    One return statement: the Triton compiler (unlike the interpreter) visits every statement after a constexpr-if
+    that returned, so an early return there is a "Return type mismatch" (fp16 vs bf16) at compile time."""
     gs = tl.arange(0, LW // 32)
     sc = tl.load(LS + key[:, None] * (LW // 32) + gs[None, :], mask=ok[:, None], other=0.0)
     if F16:
@@ -160,15 +162,17 @@ def lat_tile(LC, LS, key, ok, LW: tl.constexpr, KT: tl.constexpr, BITS: tl.const
             d = tl.arange(0, LW)
             code = tl.load(LC + key[:, None] * LW + d[None, :], mask=ok[:, None], other=0).to(tl.float32)
             v = (tl.reshape(code, (KT, LW // 32, 32)) + 0.5) * (s * 0.0078125)     # (q - 127.5) s / 128, q = code + 128
-        return tl.reshape(v, (KT, LW)).to(tl.float16)
-    if BITS == 4:
-        db = tl.arange(0, LW // 2)
-        code = tl.load(LC + key[:, None] * (LW // 2) + db[None, :], mask=ok[:, None], other=0)
-        return dequant_group_4(code, sc, M=KT, W=LW)
+        out = tl.reshape(v, (KT, LW)).to(tl.float16)
     else:
-        d = tl.arange(0, LW)
-        code = tl.load(LC + key[:, None] * LW + d[None, :], mask=ok[:, None], other=0)
-        return dequant_group_8(code, sc, M=KT, W=LW)
+        if BITS == 4:
+            db = tl.arange(0, LW // 2)
+            code = tl.load(LC + key[:, None] * (LW // 2) + db[None, :], mask=ok[:, None], other=0)
+            out = dequant_group_4(code, sc, M=KT, W=LW)
+        else:
+            d = tl.arange(0, LW)
+            code = tl.load(LC + key[:, None] * LW + d[None, :], mask=ok[:, None], other=0)
+            out = dequant_group_8(code, sc, M=KT, W=LW)
+    return out
 
 
 @triton.jit
